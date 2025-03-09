@@ -1,86 +1,41 @@
 import pytest
-import cupy as cp
-import numpy as np
-import rasterio
 import os
-from slopepy.classification import GPUSuitabilityClassifier
-from slopepy.utils import read_terrain
+from slopepy.contour import GPUContourGenerator
+import geopandas as gpd
 
-# Path to the sample HGT file
 SAMPLE_HGT = os.path.join(os.path.dirname(__file__), "data", "N01E110.hgt")
 
-def test_classifier_init():
-    """Test initialization of GPUSuitabilityClassifier."""
-    classifier = GPUSuitabilityClassifier(dst_crs="EPSG:32633")
-    assert classifier.dst_crs == "EPSG:32633"
-    assert cp.all(classifier.elev_bins == cp.array([0, 1500, 2000, 3000, float('inf')]))
-    assert cp.all(classifier.elev_scores == cp.array([5, 3, 1, 0]))
-    assert cp.all(classifier.slope_bins == cp.array([0, 15, 30, 45, float('inf')]))
-    assert cp.all(classifier.slope_scores == cp.array([5, 3, 1, 0]))
+@pytest.mark.skipif(not os.path.exists(SAMPLE_HGT), reason="Sample HGT file not found")
+def test_contour_generation(tmp_path):
+    # Test with single interval
+    contour_gen = GPUContourGenerator(contour_levels=[20], dst_crs="EPSG:32649")  # Zone 49N
+    contour_gen.process_dem(SAMPLE_HGT, str(tmp_path))
 
-def test_classifier_custom_bins():
-    """Test initialization with custom bins and scores."""
-    elev_bins = cp.array([0, 1000, 2000, float('inf')], dtype=cp.float32)
-    elev_scores = cp.array([4, 2, 0], dtype=cp.uint8)
-    slope_bins = cp.array([0, 20, 40, float('inf')], dtype=cp.float32)
-    slope_scores = cp.array([4, 2, 0], dtype=cp.uint8)
-    classifier = GPUSuitabilityClassifier(
-        elev_bins=elev_bins, elev_scores=elev_scores,
-        slope_bins=slope_bins, slope_scores=slope_scores
-    )
-    assert cp.all(classifier.elev_bins == elev_bins)
-    assert cp.all(classifier.elev_scores == elev_scores)
-    assert cp.all(classifier.slope_bins == slope_bins)
-    assert cp.all(classifier.slope_scores == slope_scores)
+    gpkg_path = str(tmp_path / "N01E110_contour.gpkg")
+    assert os.path.exists(gpkg_path)
+    gdf = gpd.read_file(gpkg_path, layer="elevation_50")
+    assert len(gdf) > 0
+    assert "elevation" in gdf.columns
+    assert gdf.crs.to_string() == "EPSG:32649"
+    assert all(gdf["elevation"] % 50 == 0)
 
-def test_cuda_unavailable(monkeypatch):
-    """Test behavior when CUDA is not available."""
-    monkeypatch.setattr(cp.cuda, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="CUDA is not available"):
-        GPUSuitabilityClassifier()
+    gpq_path = str(tmp_path / "N01E110_contour_50.gpq")
+    assert os.path.exists(gpq_path)
+    gdf_gpq = gpd.read_parquet(gpq_path)
+    assert len(gdf_gpq) > 0
 
-def test_calculate_slope():
-    """Test slope calculation on a simple DEM."""
-    classifier = GPUSuitabilityClassifier()
-    dem = cp.array([[0, 1], [0, 1]], dtype=cp.float32)  # 45-degree slope
-    resolution = 1.0
-    slope = classifier.calculate_slope(dem, resolution)
-    expected = cp.full((2, 2), 100.0, dtype=cp.float32)  # 45° = 100% slope
-    assert cp.allclose(slope, expected, atol=1e-5)
+    # Test with multiple intervals, let UTM auto-detect
+    contour_gen = GPUContourGenerator(contour_levels=[10, 20], output_dir=str(tmp_path))
+    contour_gen.process_dem(SAMPLE_HGT, str(tmp_path))
 
-def test_classify_array():
-    """Test array classification on GPU."""
-    classifier = GPUSuitabilityClassifier()
-    array = cp.array([0, 1000, 2000, 4000], dtype=cp.float32)
-    bins = cp.array([0, 1500, 2000, 3000, float('inf')], dtype=cp.float32)
-    scores = cp.array([5, 3, 1, 0], dtype=cp.uint8)
-    result = classifier.classify_array(array, bins, scores)
-    expected = cp.array([5, 3, 1, 0], dtype=cp.uint8)
-    assert cp.all(result == expected)
+    for interval in [10, 20]:
+        layer_name = f"elevation_{interval}"
+        gdf = gpd.read_file(gpkg_path, layer=layer_name)
+        assert len(gdf) > 0
+        assert "elevation" in gdf.columns
+        assert all(gdf["elevation"] % interval == 0)
 
-def test_process_dem_invalid_path():
-    """Test processing with an invalid file path."""
-    classifier = GPUSuitabilityClassifier()
-    with pytest.raises(FileNotFoundError):
-        classifier.process_dem("nonexistent_file.hgt", "output/test")
-
-@pytest.mark.skipif(not os.path.exists(SAMPLE_HGT), reason="Sample HGT file N01E110.hgt not found in tests/data/")
-def test_process_dem(tmp_path):
-    """Test full DEM processing with the sample HGT file."""
-    classifier = GPUSuitabilityClassifier()
-    output_prefix = str(tmp_path / "output/test")
-    classifier.process_dem(SAMPLE_HGT, output_prefix)
-    
-    assert os.path.exists(f"{output_prefix}_elev_class.tif")
-    assert os.path.exists(f"{output_prefix}_slope_class.tif")
-    
-    with rasterio.open(f"{output_prefix}_elev_class.tif") as src:
-        assert src.count == 1
-        assert src.dtypes[0] == 'uint8'
-        assert src.nodata == 255
-
-__all__ = [
-    'test_classifier_init', 'test_classifier_custom_bins', 'test_cuda_unavailable',
-    'test_calculate_slope', 'test_classify_array', 'test_process_dem_invalid_path',
-    'test_process_dem'
-]
+        gpq_path = str(tmp_path / f"N01E110_contour_{interval}.gpq")
+        assert os.path.exists(gpq_path)
+        gdf_gpq = gpd.read_parquet(gpq_path)
+        assert len(gdf_gpq) > 0

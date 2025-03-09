@@ -51,3 +51,7 @@ pip-wheel-metadata/
 
 # Ignore profiling data
 *.prof
+
+# local test
+linux_test
+win_test

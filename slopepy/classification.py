@@ -5,7 +5,8 @@ import numpy as np
 import rasterio
 from typing import Tuple
 import os
-from .utils import read_terrain, reproject_dem
+from .utils import read_terrain, reproject_dem, get_utm_zone
+
 
 class GPUSuitabilityClassifier:
     def __init__(self, dst_crs: str = None, elev_bins: cp.ndarray = None, elev_scores: cp.ndarray = None,
@@ -36,7 +37,7 @@ class GPUSuitabilityClassifier:
         Calculate slope in percent on GPU.
 
         Args:
-            dem (cp.ndarray): DEM array on GPU
+            dem (cp.ndarray): DEM tile on GPU
             resolution (float): Pixel resolution in meters
 
         Returns:
@@ -45,25 +46,11 @@ class GPUSuitabilityClassifier:
         y, x = cp.gradient(dem, resolution)
         slope_rad = cp.arctan(cp.sqrt(x * x + y * y))
         slope_deg = slope_rad * 180.0 / cp.pi
-        return slope_deg * 100.0 / 45.0
+        slope_percent = slope_deg * 100.0 / 45.0
+        del x, y, slope_rad, slope_deg
+        cp.cuda.Stream.null.synchronize()
+        return slope_percent
 
-    # def classify_array(self, array: cp.ndarray, bins: cp.ndarray, scores: cp.ndarray) -> cp.ndarray:
-    #     """
-    #     Classify an array into scores based on bins on GPU.
-
-    #     Args:
-    #         array (cp.ndarray): Input array (elevation or slope)
-    #         bins (cp.ndarray): Thresholds
-    #         scores (cp.ndarray): Scores for each bin
-
-    #     Returns:
-    #         cp.ndarray: Classified array with scores
-    #     """
-    #     # indices = cp.digitize(array, bins) - 1
-    #     indices = cp.digitize(array, bins, right=True) - 1
-    #     indices = cp.clip(indices, 0, len(scores) - 1)
-    #     return scores[indices]
-    
     def classify_array(self, array: cp.ndarray, bins: cp.ndarray, scores: cp.ndarray) -> cp.ndarray:
         """
         Classify an array into scores based on bins on GPU.
@@ -79,31 +66,91 @@ class GPUSuitabilityClassifier:
         indices = cp.digitize(array, bins, right=False) - 1  # Classify into bins
         indices = cp.clip(indices, 0, len(scores) - 1)  # Ensure within bounds
 
-        # ✅ **Manual fix for values that incorrectly map to a lower bin**
+        # Manual fix for binning accuracy
         for i in range(len(bins) - 1):
-            mask = (array >= bins[i]) & (array < bins[i + 1])  # Ensure values within correct range
-            indices[mask] = i  # Correct the bin index
+            mask = (array >= bins[i]) & (array < bins[i + 1])
+            indices[mask] = i
 
-        return scores[indices]
+        classified = scores[indices]
+        del indices
+        cp.cuda.Stream.null.synchronize()
+        return classified
+
+    def _process_tile(self, dem_tile: cp.ndarray, resolution: float) -> Tuple[cp.ndarray, cp.ndarray]:
+        """
+        Process a single DEM tile for elevation and slope classification.
+
+        Args:
+            dem_tile (cp.ndarray): DEM tile on GPU
+            resolution (float): Pixel resolution in meters
+
+        Returns:
+            Tuple[cp.ndarray, cp.ndarray]: (elevation classification, slope classification)
+        """
+        elev_class = self.classify_array(dem_tile, self.elev_bins, self.elev_scores)
+        slope = self.calculate_slope(dem_tile, resolution)
+        slope_class = self.classify_array(slope, self.slope_bins, self.slope_scores)
+        del slope
+        cp.cuda.Stream.null.synchronize()
+        return elev_class, slope_class
 
     def process_dem(self, input_path: str, output_prefix: str) -> None:
         """
-        Process terrain data to classify elevation and slope suitability.
+        Process terrain data to classify elevation and slope suitability using tiling.
 
         Args:
             input_path (str): Path to input terrain file (.hgt, GeoTIFF, etc.)
             output_prefix (str): Prefix for output files
         """
+        # Load and reproject DEM
         dem, profile, src_crs = read_terrain(input_path)
-        dem, profile = reproject_dem(dem, profile, src_crs, self.dst_crs)
+        nodata = profile['nodata']
+
+        # Determine effective CRS: user-provided > UTM if geographic > input CRS
+        effective_dst_crs = self.dst_crs
+        if effective_dst_crs is None and profile['crs'].is_geographic:
+            bounds = rasterio.transform.array_bounds(profile['height'], profile['width'], profile['transform'])
+            center_lon = (bounds[0] + bounds[2]) / 2
+            center_lat = (bounds[1] + bounds[3]) / 2
+            effective_dst_crs = get_utm_zone(center_lon, center_lat).to_string()
+            dem, profile = reproject_dem(dem, profile, src_crs, effective_dst_crs)
+            print(f"Reprojected DEM to UTM: {profile['crs']}")
+        elif effective_dst_crs is not None:
+            dem, profile = reproject_dem(dem, profile, src_crs, effective_dst_crs)
+            print(f"Reprojected DEM to {effective_dst_crs}")
 
         resolution = abs(profile['transform'][0])
-        elev_class = self.classify_array(dem, self.elev_bins, self.elev_scores)
-        slope = self.calculate_slope(dem, resolution)
-        slope_class = self.classify_array(slope, self.slope_bins, self.slope_scores)
+        tile_size = 1024  # Adjust based on GPU memory
+        rows, cols = dem.shape
+        elev_class_output = cp.zeros((rows, cols), dtype=cp.uint8)
+        slope_class_output = cp.zeros((rows, cols), dtype=cp.uint8)
 
-        elev_class_np = cp.asnumpy(elev_class)
-        slope_class_np = cp.asnumpy(slope_class)
+        # Tile processing with overlap for slope calculation
+        overlap = 1  # Minimal overlap for gradient calculation
+        for i in range(0, rows, tile_size):
+            for j in range(0, cols, tile_size):
+                i_start = max(i - overlap, 0)
+                j_start = max(j - overlap, 0)
+                i_end = min(i + tile_size + overlap, rows)
+                j_end = min(j + tile_size + overlap, cols)
+                dem_tile = dem[i_start:i_end, j_start:j_end].copy()
+                
+                elev_class_tile, slope_class_tile = self._process_tile(dem_tile, resolution)
+                
+                # Trim overlap for output
+                i_out_start = i - i_start
+                j_out_start = j - j_start
+                i_out_end = i_out_start + min(tile_size, rows - i)
+                j_out_end = j_out_start + min(tile_size, cols - j)
+                elev_class_output[i:i + tile_size, j:j + tile_size] = elev_class_tile[i_out_start:i_out_end, j_out_start:j_out_end]
+                slope_class_output[i:i + tile_size, j:j + tile_size] = slope_class_tile[i_out_start:i_out_end, j_out_start:j_out_end]
+                
+                del dem_tile, elev_class_tile, slope_class_tile
+                cp.cuda.Stream.null.synchronize()
+
+        # Transfer to CPU and save
+        elev_class_np = cp.asnumpy(elev_class_output)
+        slope_class_np = cp.asnumpy(slope_class_output)
 
         profile.update(dtype=rasterio.uint8, nodata=255)
         output_dir = os.path.dirname(output_prefix)
@@ -119,7 +166,8 @@ class GPUSuitabilityClassifier:
             dst.write_colormap(1, {5: (0, 255, 0), 3: (255, 255, 0), 1: (255, 165, 0), 0: (255, 0, 0)})
 
         print("GPU-accelerated suitability classification completed. Generated files:")
-        print(f"- {output_prefix}_elev_class.tif (Elevation: 5=highly, 3=moderately, 1=marginally, 0=not suitable)")
-        print(f"- {output_prefix}_slope_class.tif (Slope: 5=highly, 3=moderately, 1=marginally, 0=not suitable)")
+        print("Elevation:\n5=not suitable,\n3=marginally,\n1=moderately,\n0=highly")
+        print(f"- {output_prefix}_elev_class.tif (Elevation: 5=not suitable, 3=marginally, 1=moderately, 0=highly)")
+        print(f"- {output_prefix}_slope_class.tif (Slope: 5=not suitable, 3=marginally, 1=moderately, 0=highly)")
 
 __all__ = ['GPUSuitabilityClassifier']
