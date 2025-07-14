@@ -9,6 +9,7 @@ import cupyx.scipy.ndimage as cp_ndimage
 from typing import List, Tuple
 from .utils import read_hgt, reproject_dem
 
+
 class HillshadeCalculatorGPU:
     def __init__(self, azimuth: float = 317.0, altitude: float = 45.0, 
                  blur_window_sizes: List[float] = None, dst_crs: str = None) -> None:
