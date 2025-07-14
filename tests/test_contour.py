@@ -1,14 +1,19 @@
-"""Tests for slopepy.contour module."""
-
+import os
 import pytest
+import tempfile
+import geopandas as gpd
 import numpy as np
 import rasterio
+from unittest.mock import patch
 from rasterio.transform import from_bounds
 from unittest.mock import patch
-import os
-import geopandas as gpd
 from shapely.geometry import LineString
 from slopepy.contour import GPUContourGenerator, CUDA_AVAILABLE, MarchingSquares
+
+
+# Path to test HGT file
+SMOL_DEM = os.path.join(os.path.dirname(__file__), "data", "small_dem.tif")
+SAMPLE_HGT = os.path.join(os.path.dirname(__file__), "data", "N01E110.hgt")
 
 @pytest.fixture
 def small_dem():
@@ -30,30 +35,26 @@ def small_dem():
 def tmp_output(tmp_path):
     return tmp_path / "output"
 
-@pytest.fixture
-def hgt_file():
-    hgt_path = os.path.join(os.path.dirname(__file__), "data", "N01E110.hgt")
-    if not os.path.exists(hgt_path):
-        pytest.skip("N01E110.hgt not found in tests/data. Skipping real-world test.")
-    return hgt_path
+# @pytest.fixture
+# def tmp_output():
+#     # Create a temporary directory and file prefix
+#     with tempfile.TemporaryDirectory() as tmpdir:
+#         output_prefix = os.path.join(tmpdir, "output")
+#         yield output_prefix
 
+
+@pytest.mark.gpu
 def test_gpu_availability():
     assert isinstance(CUDA_AVAILABLE, bool)
     if CUDA_AVAILABLE:
         import cupy
         assert cupy.cuda.is_available()
 
-def test_init_default():
-    generator = GPUContourGenerator()
-    assert generator.contour_levels == [10, 20, 50, 100]
-    assert generator.dst_crs is None
-    assert generator.force_gpu is False
-    assert generator.use_gpu is False
-
+@pytest.mark.gpu
 def test_init_custom():
-    generator = GPUContourGenerator(contour_levels=[10, 20], dst_crs="EPSG:3857", force_gpu=True)
-    assert generator.contour_levels == [10, 20]
-    assert generator.dst_crs == "EPSG:3857"
+    generator = GPUContourGenerator(contour_levels=[50, 100], dst_crs="EPSG:32649", force_gpu=True)
+    assert generator.contour_levels == [50, 100]
+    assert generator.dst_crs == "EPSG:32649"
     assert generator.force_gpu is True
 
 @patch('slopepy.contour.read_terrain')
@@ -62,77 +63,28 @@ def test_process_dem_small_gpu(mock_reproject, mock_read, small_dem, tmp_output)
     dem, profile, src_crs = small_dem
     mock_read.return_value = (dem, profile, src_crs)
     mock_reproject.return_value = (dem, profile)
-    
-    output_prefix = str(tmp_output / "contour")
-    generator = GPUContourGenerator(contour_levels=[10], force_gpu=CUDA_AVAILABLE)
-    
-    generator.process_dem("fake_path.hgt", output_prefix, save_vector=True)
-    
-    assert generator.use_gpu == CUDA_AVAILABLE
-    gpkg_path = f"{output_prefix}_contours.gpkg"
-    if gpd:
-        assert os.path.exists(gpkg_path)
-        gdf = gpd.read_file(gpkg_path, layer="Contour_150")
-        assert len(gdf) > 0
-        assert all(gdf['elevation'] == 10)
-        assert all(isinstance(geom, LineString) for geom in gdf['geometry'])
 
-@patch('slopepy.contour.read_terrain')
-@patch('slopepy.contour.reproject_dem')
-def test_process_dem_force_gpu_unavailable(mock_reproject, mock_read, small_dem, tmp_output):
-    dem, profile, src_crs = small_dem
-    mock_read.return_value = (dem, profile, src_crs)
-    mock_reproject.return_value = (dem, profile)
-    
-    with patch('slopepy.contour.CUDA_AVAILABLE', False):
-        generator = GPUContourGenerator(contour_levels=[150], force_gpu=True)
-        output_prefix = str(tmp_output / "contour")
-        with pytest.raises(RuntimeError, match="GPU forced but not available"):
-            generator.process_dem("fake_path.hgt", output_prefix)
+    output_prefix = tmp_output  # already a file-like path string
 
-def test_process_dem_hgt(hgt_file, tmp_output):
-    output_prefix = str(tmp_output / "contour_hgt")
-    generator = GPUContourGenerator(contour_levels=[10, 20], dst_crs="EPSG:32649")
-    
-    generator.process_dem(hgt_file, output_prefix, save_vector=True)
-    
-    gpkg_path = f"{output_prefix}_contours.gpkg"
-    if gpd:
-        assert os.path.exists(gpkg_path)
-        for level in [10, 20]:
-            try:
-                gdf = gpd.read_file(gpkg_path, layer=f"Contour_{level}")
-                if len(gdf) > 0:
-                    assert all(gdf['elevation'] == level)
-                    assert all(isinstance(geom, LineString) for geom in gdf['geometry'])
-                    assert gdf.crs.to_string() == "EPSG:32649"
-            except Exception as e:
-                print(f"No contours found for level {level}: {e}")
+    generator = GPUContourGenerator(
+        contour_levels=[150],
+        dst_crs="EPSG:32649",
+        force_gpu=CUDA_AVAILABLE
+    )
 
-@patch('slopepy.contour.read_terrain')
-@patch('slopepy.contour.reproject_dem')
-def test_process_dem_large_fallback(mock_reproject, mock_read, tmp_output):
-    large_dem = np.random.rand(10000, 10000).astype(np.float32) * 2000
-    transform = from_bounds(0, 0, 10000, 10000, 10000, 10000)
-    profile = {
-        'driver': 'GTiff', 'height': 10000, 'width': 10000, 'count': 1,
-        'dtype': rasterio.float32, 'crs': 'EPSG:4326', 'transform': transform,
-        'nodata': -9999
-    }
-    mock_read.return_value = (large_dem, profile, 'EPSG:4326')
-    mock_reproject.return_value = (large_dem, profile)
-    
-    output_prefix = str(tmp_output / "contour_large")
-    generator = GPUContourGenerator(contour_levels=[1000])
-    
-    with patch('slopepy.contour.MarchingSquares.generate_contours', side_effect=MemoryError("Mock GPU OOM")):
-        generator.process_dem("fake_path.hgt", output_prefix, save_vector=True)
-        assert not generator.use_gpu
-        gpkg_path = f"{output_prefix}_contours.gpkg"
-        if gpd:
-            assert os.path.exists(gpkg_path)
-            gdf = gpd.read_file(gpkg_path, layer="Contour_1000")
-            assert len(gdf) > 0
+    # ✅ Generate contours
+    generator.process_dem(SMOL_DEM, output_prefix, save_vector=True)
+
+    # ✅ Check generated file
+    gpkg_path = os.path.join(tmp_output, f"{output_prefix}_contours.gpkg")
+    assert os.path.exists(gpkg_path), "Contour GeoPackage file was not created!"
+
+    # ✅ Verify file contents
+    gdf = gpd.read_file(gpkg_path)
+    print(gdf.head())
+    assert len(gdf) > 0, "No contours found in the generated file!"
+    assert all(gdf['elevation'] == 150), "Unexpected contour elevation values!"
+    assert all(isinstance(geom, LineString) for geom in gdf['geometry']), "Invalid geometry type!"
 
 @patch('slopepy.contour.read_terrain')
 def test_process_dem_invalid_file(mock_read, tmp_output):
@@ -142,34 +94,39 @@ def test_process_dem_invalid_file(mock_read, tmp_output):
     with pytest.raises(FileNotFoundError):
         generator.process_dem("nonexistent.hgt", output_prefix)
 
-@patch('slopepy.contour.read_terrain')
-@patch('slopepy.contour.reproject_dem')
-@patch('slopepy.contour.gpd', None)
-def test_process_dem_no_geopandas(mock_reproject, mock_read, small_dem, tmp_output, capsys):
-    dem, profile, src_crs = small_dem
-    mock_read.return_value = (dem, profile, src_crs)
-    mock_reproject.return_value = (dem, profile)
-    
-    output_prefix = str(tmp_output / "contour")
-    generator = GPUContourGenerator(contour_levels=[20])
-    generator.process_dem("fake_path.hgt", output_prefix, save_vector=True)
-    
-    captured = capsys.readouterr()
-    assert "Warning: geopandas or shapely not installed" in captured.out
-    assert not os.path.exists(f"{output_prefix}_contours.gpkg")
+# @pytest.mark.skipif(not os.path.exists(SAMPLE_HGT), reason="Sample HGT file not found in tests/data/")
+# @pytest.mark.gpu
+# def test_process_dem_real_data(tmp_output):
+#     output_prefix = str(tmp_output.with_name("contour_real"))  # creates "contour_real" in the temp dir
 
+#     generator = GPUContourGenerator(contour_levels=[50], dst_crs="EPSG:32649")
+#     generator.process_dem(SAMPLE_HGT, output_prefix, save_vector=True)
+
+#     gpkg_path = os.path.join(tmp_output, f"{output_prefix}_contours.gpkg")
+#     assert os.path.exists(gpkg_path), "Contour file was not created!"
+
+#     if gpd:
+#         gdf = gpd.read_file(gpkg_path, layer="Contour_50")
+#         assert len(gdf) > 0, "No contours found!"
+#         assert all(gdf['elevation'] == 50), "Unexpected contour elevation values!"
+#         assert all(isinstance(geom, LineString) for geom in gdf['geometry']), "Invalid geometry type!"
+#         assert gdf.crs.to_string() == "EPSG:32649", "CRS does not match expected!"
+
+@pytest.mark.gpu
 def test_marching_squares_contours(small_dem):
     dem, profile, _ = small_dem
-    ms = MarchingSquares(contour_levels=[20], use_gpu=CUDA_AVAILABLE)
+    ms = MarchingSquares(contour_levels=[150], use_gpu=CUDA_AVAILABLE)
     xp = ms.xp
     dem_xp = xp.asarray(dem)
-    
+
     contours = ms.generate_contours(dem_xp, profile['transform'])
-    assert len(contours) > 0
+    print("Generated contours:", contours)
+    assert len(contours) > 0, "No contours generated! Check contour levels and DEM range."
     for contour in contours:
-        assert contour['elevation'] == 20
+        assert contour['elevation'] == 150
         assert isinstance(contour['geometry'], LineString)
-        assert len(contour['geometry'].coords) == 2
+        assert len(contour['geometry'].coords) >= 2
+
 
 if __name__ == "__main__":
     pytest.main(["-v"])

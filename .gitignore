@@ -27,6 +27,10 @@ env/
 .nox/
 pytest_cache/
 
+tests/*.gpkg
+tests/data/*.aux.xml
+tests/*.ipynb
+
 # Logs and local environment settings
 *.log
 *.out
